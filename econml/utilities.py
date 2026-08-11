@@ -3,11 +3,9 @@
 
 """Utility methods."""
 
-from typing import Union
 import numpy as np
 import pandas as pd
 import scipy.sparse
-import sklearn
 import sparse as sp
 import inspect
 from collections import defaultdict, Counter
@@ -16,16 +14,71 @@ from sklearn.base import BaseEstimator, RegressorMixin, TransformerMixin
 from functools import reduce, wraps
 from sklearn.utils import check_array, check_X_y
 from sklearn.utils.validation import assert_all_finite
-from sklearn.preprocessing import OneHotEncoder, PolynomialFeatures, LabelEncoder
+from sklearn.preprocessing import PolynomialFeatures, LabelEncoder
 import warnings
 from warnings import warn
-from statsmodels.iolib.table import SimpleTable
-from statsmodels.iolib.summary import summary_return
+from ._lazy import _LazyModule
 from inspect import signature
-from packaging.version import parse
+
+from ._sklearn_compat import ensure_finite_kwargs, one_hot_encoder  # noqa: F401  (re-exported)
+
+_statsmodels_table = _LazyModule("statsmodels.iolib.table")  # lazy: only needed for Summary output
+_statsmodels_summary = _LazyModule("statsmodels.iolib.summary")  # lazy: only needed for Summary output
 
 
 MAX_RAND_SEED = np.iinfo(np.int32).max
+
+
+def add_constant(data, prepend=True, has_constant='skip'):
+    """Add a column of ones to an array.
+
+    Parameters
+    ----------
+    data : array_like
+        A column-ordered design matrix. Any input accepted by
+        :func:`numpy.asarray` is allowed, including pandas
+        ``DataFrame`` and ``Series`` objects.
+    prepend : bool, default True
+        If True the constant is in the first column, else appended.
+    has_constant : {'skip', 'add', 'raise'}, default 'skip'
+        Behavior when *data* already contains a constant column.
+        ``'skip'`` returns *data* unchanged, ``'raise'`` raises
+        ``ValueError``, ``'add'`` adds another column of ones anyway.
+
+    Returns
+    -------
+    ndarray
+        The array with a ones column prepended (or appended).
+
+    Notes
+    -----
+    This differs from :func:`statsmodels.tools.add_constant` in that the
+    return value is always a NumPy ``ndarray``. ``statsmodels`` preserves
+    pandas input types (``DataFrame`` in → ``DataFrame`` out with a
+    ``'const'`` column; ``Series`` in → ``DataFrame`` out). Here, pandas
+    inputs are converted via :func:`numpy.asarray`, which takes the
+    underlying values in row-storage order — the same data ordering
+    ``statsmodels`` operates on — but column names and the row index are
+    not carried through to the result. Callers that need to preserve
+    pandas metadata should reattach it after the call.
+    """
+    x = np.asarray(data)
+    if x.ndim == 1:
+        x = x[:, None]
+    elif x.ndim > 2:
+        raise ValueError('Only implemented for 2-dimensional arrays')
+
+    if has_constant != 'add':
+        is_const = (np.ptp(x, axis=0) == 0) & np.all(x != 0.0, axis=0)
+        if is_const.any():
+            if has_constant == 'skip':
+                return x
+            cols = ",".join(str(c) for c in np.where(is_const)[0])
+            raise ValueError(f"Column(s) {cols} are constant.")
+
+    ones = np.ones(x.shape[0])
+    parts = [ones, x] if prepend else [x, ones]
+    return np.column_stack(parts)
 
 
 class IdentityFeatures(TransformerMixin):
@@ -458,14 +511,6 @@ def reshape_Y_T(Y, T):
         T = T.reshape(-1, 1)
     return Y, T
 
-def _get_ensure_finite_arg(ensure_all_finite: Union[str, bool]) -> dict[str, Union[str, bool]]:
-    if parse(sklearn.__version__) < parse("1.6"):
-        # `force_all_finite` was renamed to `ensure_all_finite` in sklearn 1.6 and will be deprecated in 1.8
-        return {'force_all_finite': ensure_all_finite}
-    else:
-        return {'ensure_all_finite': ensure_all_finite}
-
-
 def check_inputs(Y, T, X, W=None, multi_output_T=True, multi_output_Y=True,
                  force_all_finite_X=True, force_all_finite_W=True):
     """
@@ -522,7 +567,7 @@ def check_inputs(Y, T, X, W=None, multi_output_T=True, multi_output_Y=True,
 
     """
     X, T = check_X_y(X, T, multi_output=multi_output_T, y_numeric=True,
-                     **_get_ensure_finite_arg(force_all_finite_X))
+                     **ensure_finite_kwargs(force_all_finite_X))
     if force_all_finite_X == 'allow-nan':
         try:
             assert_all_finite(X)
@@ -530,10 +575,10 @@ def check_inputs(Y, T, X, W=None, multi_output_T=True, multi_output_Y=True,
             warnings.warn("X contains NaN. Causal identification strategy can be erroneous"
                           " in the presence of missing values.")
     _, Y = check_X_y(X, Y, multi_output=multi_output_Y, y_numeric=True,
-                     **_get_ensure_finite_arg(force_all_finite_X))
+                     **ensure_finite_kwargs(force_all_finite_X))
     if W is not None:
         W, _ = check_X_y(W, Y, multi_output=multi_output_Y, y_numeric=True,
-                         **_get_ensure_finite_arg(force_all_finite_W))
+                         **ensure_finite_kwargs(force_all_finite_W))
         if force_all_finite_W == 'allow-nan':
             try:
                 assert_all_finite(W)
@@ -583,7 +628,7 @@ def check_input_arrays(*args, validate_len=True, force_all_finite=True, dtype=No
     for i, arg in enumerate(args):
         if np.ndim(arg) > 0:
             new_arg = check_array(arg, dtype=dtype, ensure_2d=ensure_2d, accept_sparse=True,
-                                  **_get_ensure_finite_arg(force_all_finite))
+                                  **ensure_finite_kwargs(force_all_finite))
             if not force_all_finite:
                 # For when checking input values is disabled
                 try:
@@ -1044,62 +1089,189 @@ class WeightedModelWrapper:
 
 
 class MultiModelWrapper:
-    """Helper class for training different models for each treatment.
+    """Train a separate underlying model for each treatment category.
+
+    Wraps a collection of base estimators, dispatching each row to the
+    estimator for its treatment category, based on a one-hot encoding of the
+    treatment that is concatenated onto the right of the feature matrix.
+
+    Most EconML estimators internally one-hot-encode discrete treatments using
+    :class:`sklearn.preprocessing.OneHotEncoder` with ``drop='first'`` (the
+    control category becomes a row of all zeros and is not represented by an
+    explicit column) and concatenate that encoding to the right of the feature
+    matrix before handing it to first-stage models. ``MultiModelWrapper``'s
+    default ``encoding='drop_first'`` matches this convention, making it
+    suitable as a wrapper for first-stage models passed to e.g.
+    :class:`~econml.dr.DRLearner` and its subclasses. The alternative
+    ``encoding='full'`` expects a full ``K``-column one-hot encoding instead
+    (no dropped category), which is the convention used internally by
+    :class:`~econml.orf.DROrthoForest`'s ``model_Y``.
 
     Parameters
     ----------
-    model_list : array_like, shape (n_T, )
-        List of models to be trained separately for each treatment group.
+    *models : estimators
+        Either ``K`` estimators (one per treatment category, the first one
+        used for the control category), or a single estimator that will be
+        cloned ``n_categories`` times.
+
+    n_categories : int, optional
+        The number of treatment categories ``K``. Required when exactly one
+        positional model is passed (so it can be cloned ``K`` times). When
+        multiple positional models are passed, this must be either ``None``
+        or equal to the number of models.
+
+    encoding : {'drop_first', 'full', 'label'}, default 'drop_first'
+        The expected encoding of the treatment block at the right of the
+        input matrix.
+
+        - ``'drop_first'``: the last ``K - 1`` columns are a drop-first
+          one-hot encoding (the all-zero row is the control category).
+        - ``'full'``: the last ``K`` columns are a full one-hot encoding
+          (column ``0`` is the control category).
+        - ``'label'``: the last column is an integer category index in
+          ``{0, ..., K - 1}``.
     """
 
-    def __init__(self, model_list=[]):
-        self.model_list = model_list
-        self.n_T = len(model_list)
+    def __init__(self, *models, n_categories=None, encoding='drop_first', model_list=None):
+        # Backward-compat shims for the pre-rewrite API
+        # (``MultiModelWrapper(model_list=[...])`` and the equivalent
+        # ``MultiModelWrapper([...])`` positional-list form). Both are
+        # accepted with a deprecation warning, and unpacked into ``models``
+        # so the rest of the constructor is unchanged.
+        if model_list is not None:
+            if models:
+                raise ValueError(
+                    "Cannot specify both positional models and the deprecated "
+                    "`model_list=` kwarg. Pass models positionally, e.g. "
+                    "MultiModelWrapper(*model_list).")
+            warnings.warn(
+                "The `model_list=` kwarg of MultiModelWrapper is deprecated and "
+                "will be removed in a future release; pass models as positional "
+                "arguments instead, e.g. MultiModelWrapper(*model_list).",
+                FutureWarning, stacklevel=2)
+            models = tuple(model_list)
+        elif len(models) == 1 and isinstance(models[0], (list, tuple)):
+            warnings.warn(
+                "Passing a list or tuple as a single positional argument to "
+                "MultiModelWrapper is deprecated and will be removed in a future "
+                "release; unpack with `*` instead, e.g. "
+                "MultiModelWrapper(*model_list).",
+                FutureWarning, stacklevel=2)
+            models = tuple(models[0])
+        if encoding not in ('drop_first', 'full', 'label'):
+            raise ValueError(
+                f"encoding must be 'drop_first', 'full', or 'label', got {encoding!r}.")
+        if len(models) == 0:
+            raise ValueError("MultiModelWrapper requires at least one model.")
+        if len(models) == 1:
+            if n_categories is None:
+                raise ValueError(
+                    "When a single model is passed, n_categories must be specified "
+                    "so the model can be cloned once per treatment category.")
+            if n_categories < 2:
+                raise ValueError("n_categories must be at least 2.")
+            self.models = [clone(models[0]) for _ in range(n_categories)]
+        else:
+            if n_categories is not None and n_categories != len(models):
+                raise ValueError(
+                    f"n_categories ({n_categories}) does not match the number of "
+                    f"positional models passed ({len(models)}).")
+            self.models = [clone(m) for m in models]
+        self.n_categories = len(self.models)
+        self.encoding = encoding
+
+    def _encoded_width(self):
+        if self.encoding == 'full':
+            return self.n_categories
+        if self.encoding == 'label':
+            return 1
+        return self.n_categories - 1
+
+    def _split(self, Xt):
+        """Return (X, labels) where labels is the per-row category index in [0, n_categories)."""
+        width = self._encoded_width()
+        if Xt.shape[1] < width:
+            raise ValueError(
+                f"Input has only {Xt.shape[1]} columns, but the trailing "
+                f"{width} columns are required to encode "
+                f"{self.n_categories} treatment categories with "
+                f"encoding={self.encoding!r}.")
+        if self.encoding == 'label':
+            X = Xt[:, :-1]
+            # The trailing column is a per-row category index; densify only
+            # that single column (cheap even for huge sparse inputs).
+            labels = todense(Xt[:, -1]).ravel().astype(int)
+            return X, labels
+        # Both 'drop_first' and 'full' reduce to a (K-1)-column drop-first
+        # one-hot encoding: for 'full' the leading control column drops out,
+        # leaving the trailing K-1 columns as exactly the drop-first form.
+        # ``inverse_onehot`` handles both dense and sparse inputs via matmul.
+        X = Xt[:, :-width]
+        labels = inverse_onehot(Xt[:, -(self.n_categories - 1):])
+        return X, labels
 
     def fit(self, Xt, y, sample_weight=None):
-        """Fit underlying list of models with weighted inputs.
+        """Fit each underlying model on its category's rows.
 
         Parameters
         ----------
-        X : array_like, shape (n_samples, n_features + n_treatments)
-            Training data. The last n_T columns should be a one-hot encoding of the treatment assignment.
+        Xt : array_like, shape (n_samples, n_features + width)
+            Training data. ``width`` depends on ``encoding``:
+            ``n_categories - 1`` for ``'drop_first'`` (the default),
+            ``n_categories`` for ``'full'``, or ``1`` for ``'label'``.
+            The trailing block must be a treatment encoding of the
+            corresponding form.
 
-        y : array_like, shape (n_samples, )
+        y : array_like
             Target values.
+
+        sample_weight : array_like, optional
+            Per-sample weights, forwarded to each underlying model.
 
         Returns
         -------
-        self: an instance of the class
+        self : MultiModelWrapper
         """
-        X = Xt[:, :-self.n_T]
-        t = Xt[:, -self.n_T:]
-        if sample_weight is None:
-            for i in range(self.n_T):
-                mask = (t[:, i] == 1)
-                self.model_list[i].fit(X[mask], y[mask])
-        else:
-            for i in range(self.n_T):
-                mask = (t[:, i] == 1)
-                self.model_list[i].fit(X[mask], y[mask], sample_weight[mask])
+        X, labels = self._split(Xt)
+        y = np.asarray(y)
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight)
+        for i, mdl in enumerate(self.models):
+            mask = labels == i
+            if sample_weight is None:
+                mdl.fit(X[mask], y[mask])
+            else:
+                mdl.fit(X[mask], y[mask], sample_weight=sample_weight[mask])
         return self
 
     def predict(self, Xt):
-        """Predict using the linear model.
+        """Predict by dispatching each row to its category's model.
 
         Parameters
         ----------
-        X : array_like, shape (n_samples, n_features + n_treatments)
-            Samples. The last n_T columns should be a one-hot encoding of the treatment assignment.
+        Xt : array_like, shape (n_samples, n_features + width)
+            Samples to predict for. See :meth:`fit` for the expected layout.
 
         Returns
         -------
-        C : array, shape (n_samples, )
-            Returns predicted values.
+        C : array, shape (n_samples, ...)
+            Predictions, with category-specific predictions reassembled in
+            the original row order.
         """
-        X = Xt[:, :-self.n_T]
-        t = Xt[:, -self.n_T:]
-        predictions = [self.model_list[np.nonzero(t[i])[0][0]].predict(X[[i]]) for i in range(len(X))]
-        return np.concatenate(predictions)
+        X, labels = self._split(Xt)
+        out = None
+        for i, mdl in enumerate(self.models):
+            mask = labels == i
+            if not np.any(mask):
+                continue
+            preds = mdl.predict(X[mask])
+            if out is None:
+                shape = (X.shape[0],) + np.shape(preds)[1:]
+                out = np.empty(shape, dtype=np.asarray(preds).dtype)
+            out[mask] = preds
+        if out is None:
+            return np.empty(0)
+        return out
 
 
 def _safe_norm_ppf(q, loc=0, scale=1):
@@ -1147,7 +1319,7 @@ class Summary:
         return self.as_html()
 
     def add_table(self, res, header, index, title):
-        table = SimpleTable(res, header, index, title)
+        table = _statsmodels_table.SimpleTable(res, header, index, title)
         self.tables.append(table)
 
     def add_extra_txt(self, etext):
@@ -1170,7 +1342,7 @@ class Summary:
             summary tables and extra text as one string
 
         """
-        txt = summary_return(self.tables, return_fmt='text')
+        txt = _statsmodels_summary.summary_return(self.tables, return_fmt='text')
         if self.extra_txt is not None:
             txt = txt + '\n\n' + self.extra_txt
         return txt
@@ -1190,7 +1362,7 @@ class Summary:
         tables.
 
         """
-        latex = summary_return(self.tables, return_fmt='latex')
+        latex = _statsmodels_summary.summary_return(self.tables, return_fmt='latex')
         if self.extra_txt is not None:
             latex = latex + '\n\n' + self.extra_txt.replace('\n', ' \\newline\n ')
         return latex
@@ -1204,7 +1376,7 @@ class Summary:
             concatenated summary tables in comma delimited format
 
         """
-        csv = summary_return(self.tables, return_fmt='csv')
+        csv = _statsmodels_summary.summary_return(self.tables, return_fmt='csv')
         if self.extra_txt is not None:
             csv = csv + '\n\n' + self.extra_txt
         return csv
@@ -1218,39 +1390,10 @@ class Summary:
             concatenated summary tables in HTML format
 
         """
-        html = summary_return(self.tables, return_fmt='html')
+        html = _statsmodels_summary.summary_return(self.tables, return_fmt='html')
         if self.extra_txt is not None:
             html = html + '<br/><br/>' + self.extra_txt.replace('\n', '<br/>')
         return html
-
-
-class SeparateModel:
-    """
-    Splits the data based on the last feature and trains a separate model for each subsample.
-
-    At predict time, it uses the last feature to choose which model to use to predict.
-    """
-
-    def __init__(self, *models):
-        self.models = [clone(model) for model in models]
-
-    def fit(self, XZ, T):
-        for (i, m) in enumerate(self.models):
-            inds = (XZ[:, -1] == i)
-            m.fit(XZ[inds, :-1], T[inds])
-        return self
-
-    def predict(self, XZ):
-        t_pred = np.zeros(XZ.shape[0])
-        for (i, m) in enumerate(self.models):
-            inds = (XZ[:, -1] == i)
-            if np.any(inds):
-                t_pred[inds] = m.predict(XZ[inds, :-1])
-        return t_pred
-
-    @property
-    def coef_(self):
-        return np.concatenate((model.coef_ for model in self.models))
 
 
 def deprecated(message, category=FutureWarning):
@@ -1317,6 +1460,47 @@ def _deprecate_positional(message, bad_args, category=FutureWarning):
             return to_wrap(*args, **kwargs)
         return m
     return decorator
+
+
+@deprecated(
+    "SeparateModel is deprecated and will be removed in a future release; "
+    "use MultiModelWrapper(..., encoding='label') instead, which provides "
+    "the same trailing-integer-column dispatch behavior."
+)
+class SeparateModel:
+    """
+    Splits the data based on the last feature and trains a separate model for each subsample.
+
+    At predict time, it uses the last feature to choose which model to use to predict.
+
+    .. deprecated::
+        Use :class:`MultiModelWrapper` with ``encoding='label'`` instead,
+        which has the same trailing-integer-column dispatch behavior.
+        ``MultiModelWrapper`` additionally supports the one-hot encodings
+        produced by EconML's discrete-treatment estimators (see its
+        ``encoding`` parameter).
+    """
+
+    def __init__(self, *models):
+        self.models = [clone(model) for model in models]
+
+    def fit(self, XZ, T):
+        for (i, m) in enumerate(self.models):
+            inds = (XZ[:, -1] == i)
+            m.fit(XZ[inds, :-1], T[inds])
+        return self
+
+    def predict(self, XZ):
+        t_pred = np.zeros(XZ.shape[0])
+        for (i, m) in enumerate(self.models):
+            inds = (XZ[:, -1] == i)
+            if np.any(inds):
+                t_pred[inds] = m.predict(XZ[inds, :-1])
+        return t_pred
+
+    @property
+    def coef_(self):
+        return np.concatenate((model.coef_ for model in self.models))
 
 
 class MissingModule:
@@ -1555,14 +1739,3 @@ def strata_from_discrete_arrays(arrs):
     return curr_array
 
 
-def one_hot_encoder(sparse=False, **kwargs):
-    """
-    Create a :class:`~sklearn.preprocessing.OneHotEncoder`.
-
-    This handles the breaking name change from `sparse` to `sparse_output`
-    between sklearn versions 1.1 and 1.2.
-    """
-    if parse(sklearn.__version__) < parse("1.2"):
-        return OneHotEncoder(sparse=sparse, **kwargs)
-    else:
-        return OneHotEncoder(sparse_output=sparse, **kwargs)
